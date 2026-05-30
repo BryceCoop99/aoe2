@@ -102,6 +102,9 @@ export interface RawInspection {
     eofOffset?: number;
     operationCountsTotal?: number;
     actionCountsTotal?: number;
+    timelineEventsTotal?: number;
+    timelineEventsCaptured?: number;
+    timelineEventsTruncated?: boolean;
     gameDataCounts?: Record<string, number>;
   };
   operationCounts: Record<string, number>;

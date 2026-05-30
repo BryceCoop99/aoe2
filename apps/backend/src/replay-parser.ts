@@ -13,18 +13,33 @@ const defaultPythonBin =
 
 const pythonBin = process.env.REPLAY_PYTHON_BIN || defaultPythonBin;
 const parserScriptPath = path.join(appRoot, "scripts", "parse_replay.py");
+const maxTimelineEvents = parseNonNegativeInt(
+  process.env.REPLAY_MAX_TIMELINE_EVENTS,
+  0,
+).toString();
+const parserStdoutBufferMb = parsePositiveInt(
+  process.env.REPLAY_PARSER_STDOUT_BUFFER_MB,
+  100,
+);
 
 export async function parseReplayFile(filePath: string, replayId: string) {
   const { stdout, stderr } = await execFileAsync(
     pythonBin,
-    [parserScriptPath, "--replay-id", replayId, filePath],
+    [
+      parserScriptPath,
+      "--replay-id",
+      replayId,
+      "--max-events",
+      maxTimelineEvents,
+      filePath,
+    ],
     {
       cwd: appRoot,
       env: {
         ...process.env,
         PYTHONIOENCODING: "utf-8",
       },
-      maxBuffer: 20 * 1024 * 1024,
+      maxBuffer: parserStdoutBufferMb * 1024 * 1024,
       windowsHide: true,
     },
   );
@@ -34,4 +49,22 @@ export async function parseReplayFile(filePath: string, replayId: string) {
   }
 
   return JSON.parse(stdout) as ReplayReport;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number) {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInt(value: string | undefined, fallback: number) {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }

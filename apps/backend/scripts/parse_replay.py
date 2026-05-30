@@ -1216,11 +1216,14 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
 
     total_parse_ms = round((perf_counter() - parse_started_at) * 1000, 2)
 
+    max_events = max(0, int(args.max_events))
+    visible_events = sorted_events if max_events == 0 else sorted_events[:max_events]
+
     report = {
         "ok": True,
         "match": match,
         "players": participants,
-        "events": sorted_events[: args.max_events],
+        "events": visible_events,
         "insights": build_insights(participants),
         "rawInspection": {
             "parserVersion": PARSER_VERSION,
@@ -1247,6 +1250,9 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 "eofOffset": file_size,
                 "operationCountsTotal": sum(operation_counts.values()),
                 "actionCountsTotal": sum(action_counts.values()),
+                "timelineEventsTotal": len(sorted_events),
+                "timelineEventsCaptured": len(visible_events),
+                "timelineEventsTruncated": len(visible_events) < len(sorted_events),
                 "gameDataCounts": {
                     "civilizations": len(game_data["civilizations"]),
                     "technologies": len(game_data["technologies"]),
@@ -1428,6 +1434,9 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
                 "eofOffset": file_size,
                 "operationCountsTotal": 0,
                 "actionCountsTotal": 0,
+                "timelineEventsTotal": 1,
+                "timelineEventsCaptured": 1,
+                "timelineEventsTruncated": False,
                 "gameDataCounts": {
                     "civilizations": 0,
                     "technologies": 0,
@@ -1462,7 +1471,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("replay_path")
     parser.add_argument("--replay-id", default="")
     parser.add_argument("--aoe2-path", default=None)
-    parser.add_argument("--max-events", type=int, default=160)
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=0,
+        help="Maximum timeline events to include. Use 0 for every recovered event.",
+    )
     parser.add_argument("--max-chats", type=int, default=50)
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("--debug", action="store_true")
