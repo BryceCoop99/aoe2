@@ -1,6 +1,17 @@
-export type ReplayStatus = "uploaded" | "processing" | "complete" | "failed";
+export type ReplayStatus =
+  | "uploaded"
+  | "processing"
+  | "complete"
+  | "partial"
+  | "failed";
 
 export type InsightSeverity = "info" | "warning" | "good" | "critical";
+
+export interface ParserDiagnosticItem {
+  code: string;
+  message: string;
+  context?: unknown;
+}
 
 export interface MatchOverview {
   id: string;
@@ -12,8 +23,24 @@ export interface MatchOverview {
   version: string;
   saveVersion: number | null;
   parserVersion: string;
+  schemaVersion?: string;
   winningTeam: number | null;
   winningPlayerSlots: number[];
+}
+
+export interface PlayerCommandSummary {
+  totalActions: number;
+  buildActions: number;
+  researchActions: number;
+  makeActions: number;
+  moveActions: number;
+  otherActions: number;
+}
+
+export interface PlayerDetectedTimings {
+  technologies: Record<string, number>;
+  buildings: Record<string, number>;
+  units: Record<string, number>;
 }
 
 export interface PlayerSummary {
@@ -35,6 +62,8 @@ export interface PlayerSummary {
   firstTownCenterAfterCastleTimeSeconds: number | null;
   firstCastleTimeSeconds: number | null;
   resignedAtSeconds: number | null;
+  commandSummary?: PlayerCommandSummary;
+  detectedTimings?: PlayerDetectedTimings;
 }
 
 export interface ReplayEvent {
@@ -42,6 +71,7 @@ export interface ReplayEvent {
   playerSlot: number | null;
   type: string;
   label: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ReplayInsight {
@@ -53,9 +83,30 @@ export interface ReplayInsight {
 
 export interface RawInspection {
   parserVersion: string;
+  schemaVersion?: string;
   fileSizeBytes: number;
+  file?: {
+    path: string;
+    name: string;
+    stem: string;
+    suffix: string;
+    sizeBytes: number;
+  };
+  diagnostics?: {
+    warnings: ParserDiagnosticItem[];
+    parseErrors: ParserDiagnosticItem[];
+    timingsMs?: Record<string, number | null>;
+    operationIndex?: number;
+    skippedOperations?: number;
+    lastGoodOffset?: number;
+    eofOffset?: number;
+    operationCountsTotal?: number;
+    actionCountsTotal?: number;
+    gameDataCounts?: Record<string, number>;
+  };
   operationCounts: Record<string, number>;
   actionCounts: Record<string, number>;
+  actionCountsByPlayer?: Record<string, Record<string, number>>;
   chats: Array<{
     timeSeconds: number;
     playerSlot: number | null;
@@ -75,6 +126,10 @@ export interface RawInspection {
 }
 
 export interface ReplayReport {
+  ok?: boolean;
+  partial?: boolean;
+  error?: string;
+  details?: unknown;
   match: MatchOverview;
   players: PlayerSummary[];
   events: ReplayEvent[];

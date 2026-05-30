@@ -1,6 +1,6 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { ReplayRecord, ReplayReport } from "./report-types.js";
+import { ReplayRecord, ReplayReport, ReplayStatus } from "./report-types.js";
 
 const storageRoot = path.resolve(process.cwd(), "storage");
 const replaysRoot = path.join(storageRoot, "replays");
@@ -36,7 +36,21 @@ async function writeIndex(index: ReplayIndexFile) {
 
 export async function createReplayRecord(record: ReplayRecord) {
   const index = await readIndex();
-  index.replays.push(record);
+
+  const existingIndex = index.replays.findIndex(
+    (existingRecord) => existingRecord.id === record.id,
+  );
+
+  if (existingIndex >= 0) {
+    index.replays[existingIndex] = {
+      ...index.replays[existingIndex],
+      ...record,
+      updatedAt: new Date().toISOString(),
+    };
+  } else {
+    index.replays.push(record);
+  }
+
   await writeIndex(index);
 }
 
@@ -45,12 +59,60 @@ export async function updateReplayRecord(
   updater: (record: ReplayRecord) => ReplayRecord,
 ) {
   const index = await readIndex();
-  const nextReplays = index.replays.map((record) =>
-    record.id === replayId ? updater(record) : record,
-  );
+
+  let didUpdate = false;
+
+  const nextReplays = index.replays.map((record) => {
+    if (record.id !== replayId) {
+      return record;
+    }
+
+    didUpdate = true;
+
+    return {
+      ...updater(record),
+      updatedAt: new Date().toISOString(),
+    };
+  });
 
   index.replays = nextReplays;
+
+  if (!didUpdate) {
+    console.warn("[updateReplayRecord] replay record not found", {
+      replayId,
+    });
+  }
+
   await writeIndex(index);
+}
+
+export async function markReplayParsed(replayId: string, report: ReplayReport) {
+  const status: ReplayStatus = report.partial ? "partial" : "complete";
+
+  await updateReplayRecord(replayId, (record) => ({
+    ...record,
+    status,
+    map: report.match?.map ?? record.map,
+    durationSeconds:
+      typeof report.match?.durationSeconds === "number"
+        ? report.match.durationSeconds
+        : record.durationSeconds,
+    error: report.partial
+      ? (report.rawInspection?.diagnostics?.parseErrors?.[0]?.message ??
+        "Replay uploaded, but full parsing is not supported yet.")
+      : null,
+  }));
+}
+
+export async function markReplayFailed(replayId: string, error: unknown) {
+  const message =
+    error instanceof Error ? error.message : "Replay parsing failed.";
+
+  await updateReplayRecord(replayId, (record) => ({
+    ...record,
+    status: "failed",
+    error: message,
+  }));
 }
 
 export async function getReplayRecord(replayId: string) {
@@ -60,6 +122,7 @@ export async function getReplayRecord(replayId: string) {
 
 export async function listReplayRecords(limit = 20) {
   const index = await readIndex();
+
   return index.replays
     .slice()
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
@@ -76,10 +139,13 @@ export async function saveReplayFile(
   const replayDir = path.join(replaysRoot, replayId);
   await mkdir(replayDir, { recursive: true });
 
-  const sanitizedFilename = originalFilename.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const storedFilename = sanitizedFilename.endsWith(".aoe2record")
+  const sanitizedFilename =
+    originalFilename.replace(/[^a-zA-Z0-9._-]/g, "_") || "replay.aoe2record";
+
+  const storedFilename = sanitizedFilename.toLowerCase().endsWith(".aoe2record")
     ? sanitizedFilename
     : `${sanitizedFilename}.aoe2record`;
+
   const filePath = path.join(replayDir, storedFilename);
 
   await writeFile(filePath, buffer);

@@ -20,10 +20,22 @@ const PORT = Number(process.env.PORT || 4000);
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 const MAX_BODY_SIZE = "75mb";
+const allowedOrigins = new Set(
+  FRONTEND_URL.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+);
 
 app.use(
   cors({
-    origin: FRONTEND_URL,
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.has(origin) || isLocalDevOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`Origin ${origin} is not allowed by CORS.`));
+    },
     credentials: true,
   }),
 );
@@ -166,4 +178,20 @@ function toErrorMessage(error: unknown) {
   }
 
   return "An unexpected replay parsing error occurred.";
+}
+
+function isLocalDevOrigin(origin: string) {
+  try {
+    const parsedOrigin = new URL(origin);
+    const isLocalHost =
+      parsedOrigin.hostname === "localhost" ||
+      parsedOrigin.hostname === "127.0.0.1" ||
+      parsedOrigin.hostname.startsWith("192.168.") ||
+      parsedOrigin.hostname.startsWith("10.") ||
+      parsedOrigin.hostname.match(/^172\.(1[6-9]|2\d|3[0-1])\./);
+
+    return isLocalHost && parsedOrigin.port.startsWith("30");
+  } catch {
+    return false;
+  }
 }
