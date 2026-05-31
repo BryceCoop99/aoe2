@@ -26,6 +26,9 @@ export interface MatchOverview {
   schemaVersion?: string;
   winningTeam: number | null;
   winningPlayerSlots: number[];
+  resultSource?: string;
+  resultConfidence?: "high" | "medium" | "low" | null;
+  resultExplanation?: string | null;
 }
 
 export interface PlayerCommandSummary {
@@ -105,6 +108,13 @@ export interface RawInspection {
     timelineEventsTotal?: number;
     timelineEventsCaptured?: number;
     timelineEventsTruncated?: boolean;
+    resultInference?: {
+      source: string;
+      confidence?: "high" | "medium" | "low" | null;
+      explanation?: string;
+      scoreRatio?: number;
+      teamMetrics?: unknown;
+    };
     gameDataCounts?: Record<string, number>;
   };
   operationCounts: Record<string, number>;

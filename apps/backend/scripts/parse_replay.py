@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """Parse an AoE2 replay into an MVP-friendly analytics report.
 
+This version intentionally extracts much more than the UI currently displays:
+- report-friendly match/player/event/insight fields
+- raw fast-operation action stream
+- all captured chat messages, unless limited by CLI flags
+- sync stat rows and per-player timeseries, when the rec contains them
+- viewlock samples
+- postgame payloads, when available
+- raw JSON-safe header data
+- optional mgz.model serialized output
+- optional mgz.summary output
+
 Important:
 - The final parse result is printed to stdout as JSON.
 - Debug logs are written to stderr so the Node server can safely parse stdout.
@@ -9,6 +20,8 @@ Important:
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +29,8 @@ import re
 import sys
 import traceback
 from collections import Counter, defaultdict
+from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -25,8 +40,27 @@ from mgz.fast import meta, operation
 from mgz.fast.enums import Action, Operation
 from mgz.fast.header import parse as parse_header
 
-PARSER_VERSION = "mgz-fast 1.0.0"
-UPLOAD_REPORT_SCHEMA_VERSION = "replay-report-v1"
+try:  # Official aoc-mgz model API. May not exist in mgz-fast-only installs.
+    from mgz.model import parse_match as mgz_parse_match
+    from mgz.model import serialize as mgz_serialize_model
+except Exception:  # pragma: no cover - optional dependency surface
+    mgz_parse_match = None
+    mgz_serialize_model = None
+
+try:  # Official aoc-mgz summary API. May not exist in mgz-fast-only installs.
+    from mgz.summary import Summary as MgzSummary
+except Exception:  # pragma: no cover - optional dependency surface
+    MgzSummary = None
+
+try:  # Official aoc-mgz/aocref reference data.
+    from mgz.reference import get_consts as mgz_get_consts
+    from mgz.reference import get_dataset as mgz_get_dataset
+except Exception:  # pragma: no cover - optional dependency surface
+    mgz_get_consts = None
+    mgz_get_dataset = None
+
+PARSER_VERSION = "mgz-fast 1.0.0 + exhaustive extraction"
+UPLOAD_REPORT_SCHEMA_VERSION = "replay-report-v2"
 
 LOGGER = logging.getLogger("parse_replay")
 
@@ -53,6 +87,15 @@ GAME_TYPE_NAMES = {
     8: "Turbo Random Map",
 }
 
+STARTING_AGE_NAMES = {
+    0: "Standard",
+    1: "Dark Age",
+    2: "Feudal Age",
+    3: "Castle Age",
+    4: "Imperial Age",
+    5: "Post-Imperial Age",
+}
+
 KEY_BUILDING_NAMES = {
     "Archery Range",
     "Barracks",
@@ -71,6 +114,7 @@ KEY_BUILDING_NAMES = {
     "Siege Workshop",
     "Stable",
     "Town Center",
+    "University",
 }
 
 MILITARY_BUILDING_NAMES = {
@@ -89,13 +133,17 @@ MILITARY_BUILDING_NAMES = {
 
 ECONOMY_TECH_NAMES = {
     "Bow Saw",
+    "Crop Rotation",
     "Double-Bit Axe",
     "Gold Mining",
+    "Gold Shaft Mining",
     "Hand Cart",
     "Heavy Plow",
     "Horse Collar",
     "Loom",
     "Stone Mining",
+    "Stone Shaft Mining",
+    "Two-Man Saw",
     "Wheelbarrow",
 }
 
@@ -142,6 +190,46 @@ FILENAME_DATE_RE = re.compile(
     r"(?P<year>\d{4})[._-](?P<month>\d{2})[._-](?P<day>\d{2})[_ -]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})?"
 )
 
+# Minimal safety net when external reference data cannot name common techs.
+KNOWN_TECH_NAMES_BY_ID = {
+    12: "Crop Rotation",
+    13: "Heavy Plow",
+    14: "Horse Collar",
+    22: "Loom",
+    55: "Gold Mining",
+    101: "Feudal Age",
+    102: "Castle Age",
+    103: "Imperial Age",
+    202: "Double-Bit Axe",
+    203: "Bow Saw",
+    213: "Wheelbarrow",
+    249: "Hand Cart",
+    278: "Stone Mining",
+    279: "Stone Shaft Mining",
+}
+
+# Minimal safety net for common building object IDs.
+KNOWN_BUILDING_NAMES_BY_ID = {
+    12: "Barracks",
+    45: "Dock",
+    49: "Siege Workshop",
+    68: "Mill",
+    70: "House",
+    71: "Town Center",
+    82: "Castle",
+    84: "Market",
+    87: "Archery Range",
+    101: "Stable",
+    103: "Blacksmith",
+    104: "Monastery",
+    109: "Town Center",
+    141: "Town Center",
+    142: "Town Center",
+    209: "University",
+    562: "Lumber Camp",
+    584: "Mining Camp",
+}
+
 JsonDict = dict[str, Any]
 
 
@@ -172,32 +260,125 @@ def safe_json_dumps(value: Any) -> str:
         return str(value)
 
 
+def to_jsonable(
+    value: Any, *, max_depth: int = 25, _depth: int = 0, _seen: set[int] | None = None
+) -> Any:
+    """Convert arbitrary parser objects into JSON-safe values.
+
+    This avoids circular references and keeps huge byte blobs from exploding the
+    JSON report. For binary data, it records length and a hex prefix.
+    """
+    if _seen is None:
+        _seen = set()
+
+    if _depth > max_depth:
+        return {"__truncated": "max_depth", "type": type(value).__name__}
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, bytes):
+        return {
+            "__type": "bytes",
+            "length": len(value),
+            "utf8Preview": value[:256].decode("utf-8", errors="replace"),
+            "hexPreview": value[:256].hex(),
+        }
+
+    if isinstance(value, bytearray):
+        return to_jsonable(
+            bytes(value), max_depth=max_depth, _depth=_depth, _seen=_seen
+        )
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, Enum):
+        return value.name
+
+    object_id = id(value)
+    if object_id in _seen:
+        return {"__cycle": type(value).__name__}
+
+    if dataclasses.is_dataclass(value):
+        _seen.add(object_id)
+        return {
+            field.name: to_jsonable(
+                getattr(value, field.name),
+                max_depth=max_depth,
+                _depth=_depth + 1,
+                _seen=_seen,
+            )
+            for field in dataclasses.fields(value)
+        }
+
+    if isinstance(value, dict):
+        _seen.add(object_id)
+        output: JsonDict = {}
+        for key, item in value.items():
+            if isinstance(key, (str, int, float, bool)) or key is None:
+                json_key = str(key)
+            else:
+                json_key = safe_enum_name(key)
+            output[json_key] = to_jsonable(
+                item, max_depth=max_depth, _depth=_depth + 1, _seen=_seen
+            )
+        return output
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        _seen.add(object_id)
+        return [
+            to_jsonable(item, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
+            for item in value
+        ]
+
+    if hasattr(value, "_asdict"):
+        try:
+            return to_jsonable(
+                value._asdict(), max_depth=max_depth, _depth=_depth + 1, _seen=_seen
+            )
+        except Exception:
+            pass
+
+    if hasattr(value, "__dict__"):
+        _seen.add(object_id)
+        try:
+            return to_jsonable(
+                vars(value), max_depth=max_depth, _depth=_depth + 1, _seen=_seen
+            )
+        except Exception:
+            pass
+
+    return str(value)
+
+
+def append_limited(items: list[Any], item: Any, max_items: int) -> bool:
+    if max_items < 0 or len(items) < max_items:
+        items.append(item)
+        return True
+    return False
+
+
+def limited_items(items: list[Any], max_items: int) -> list[Any]:
+    if max_items < 0:
+        return items
+    return items[:max_items]
+
+
 def add_warning(
     warnings: list[JsonDict], code: str, message: str, **context: Any
 ) -> None:
-    warnings.append(
-        {
-            "code": code,
-            "message": message,
-            "context": context,
-        }
-    )
+    warnings.append({"code": code, "message": message, "context": context})
     LOGGER.warning("%s: %s %s", code, message, safe_json_dumps(context))
 
 
 def add_parse_error(
-    errors: list[JsonDict],
-    code: str,
-    message: str,
-    **context: Any,
+    errors: list[JsonDict], code: str, message: str, **context: Any
 ) -> None:
-    errors.append(
-        {
-            "code": code,
-            "message": message,
-            "context": context,
-        }
-    )
+    errors.append({"code": code, "message": message, "context": context})
     LOGGER.error("%s: %s %s", code, message, safe_json_dumps(context))
 
 
@@ -218,12 +399,7 @@ def read_json_file(path: Path, warnings: list[JsonDict]) -> JsonDict | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        add_warning(
-            warnings,
-            "game_data_file_missing",
-            "Expected game data file was not found.",
-            path=str(path),
-        )
+        return None
     except json.JSONDecodeError as error:
         add_warning(
             warnings,
@@ -240,19 +416,15 @@ def read_json_file(path: Path, warnings: list[JsonDict]) -> JsonDict | None:
             path=str(path),
             error=str(error),
         )
-
     return None
 
 
 def resolve_aoe2_path(
-    explicit_path: str | None,
-    warnings: list[JsonDict],
+    explicit_path: str | None, warnings: list[JsonDict]
 ) -> Path | None:
     candidate_paths: list[Path] = []
-
     if explicit_path:
         candidate_paths.append(Path(explicit_path))
-
     candidate_paths.extend(DEFAULT_AOE2_PATHS)
 
     for path in candidate_paths:
@@ -263,7 +435,7 @@ def resolve_aoe2_path(
     add_warning(
         warnings,
         "aoe2_install_path_not_found",
-        "AoE2 install path was not found. The report will use fallback IDs for civs, techs, buildings, and units.",
+        "AoE2 install path was not found. The report will rely on bundled/parser reference data and fallback IDs.",
         explicitPath=explicit_path,
         envPath=ENV_AOE2_INSTALL_PATH,
         searchedPaths=[str(path) for path in candidate_paths],
@@ -271,69 +443,80 @@ def resolve_aoe2_path(
     return None
 
 
+def reference_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("name", "Name", "internal_name", "display_name"):
+            name = value.get(key)
+            if isinstance(name, str) and name.strip():
+                return name
+    return None
+
+
 def load_game_data(
-    explicit_aoe2_path: str | None,
-    warnings: list[JsonDict],
-) -> dict[str, dict[int, str]]:
+    explicit_aoe2_path: str | None, warnings: list[JsonDict]
+) -> dict[str, Any]:
+    """Load names from the local AoE2 install when available.
+
+    This is supplemented later by aocref/mgz.reference after the header gives us
+    version/dataset information.
+    """
     aoe2_path = resolve_aoe2_path(explicit_aoe2_path, warnings)
 
-    civ_names: dict[int, str] = {}
-    tech_names: dict[int, str] = {}
-    building_names: dict[int, str] = {}
-    unit_names: dict[int, str] = {}
+    game_data: dict[str, Any] = {
+        "civilizations": {},
+        "technologies": dict(KNOWN_TECH_NAMES_BY_ID),
+        "buildings": dict(KNOWN_BUILDING_NAMES_BY_ID),
+        "units": {},
+        "objects": dict(KNOWN_BUILDING_NAMES_BY_ID),
+        "reference": {},
+    }
 
     if aoe2_path is None:
-        return {
-            "civilizations": civ_names,
-            "technologies": tech_names,
-            "buildings": building_names,
-            "units": unit_names,
-        }
+        return game_data
 
     civilizations_path = (
         aoe2_path / "resources" / "_common" / "dat" / "civilizations.json"
     )
     civilizations = read_json_file(civilizations_path, warnings)
-
     if civilizations:
         for index, civilization in enumerate(
             civilizations.get("civilization_list", [])
         ):
-            if not isinstance(civilization, dict):
-                continue
-
-            civ_names[index] = civilization.get("internal_name", f"Civ {index}")
+            if isinstance(civilization, dict):
+                game_data["civilizations"][index] = civilization.get(
+                    "internal_name", f"Civ {index}"
+                )
 
     civ_tech_tree_dir = aoe2_path / "resources" / "_common" / "dat" / "CivTechTrees"
-
     if civ_tech_tree_dir.exists():
         for tech_tree_path in civ_tech_tree_dir.glob("*.json"):
             tech_tree = read_json_file(tech_tree_path, warnings)
             if not tech_tree:
                 continue
-
             for node in tech_tree.get("civ_techs_buildings", []):
                 if not isinstance(node, dict):
                     continue
-
                 try:
                     node_id = int(node.get("Node ID"))
                 except (TypeError, ValueError):
                     continue
-
                 name = node.get("Name")
                 if not isinstance(name, str) or not name.strip():
                     continue
-
                 node_type = str(node.get("Node Type", ""))
                 use_type = str(node.get("Use Type", ""))
-
                 if "Building" in node_type or use_type == "Building":
-                    building_names.setdefault(node_id, name)
+                    game_data["buildings"].setdefault(node_id, name)
+                    game_data["objects"].setdefault(node_id, name)
                 elif "Research" in node_type:
-                    tech_names.setdefault(node_id, name)
+                    game_data["technologies"].setdefault(node_id, name)
                 elif "Unit" in node_type or use_type == "Unit":
-                    unit_names.setdefault(node_id, name)
+                    game_data["units"].setdefault(node_id, name)
+                    game_data["objects"].setdefault(node_id, name)
     else:
         add_warning(
             warnings,
@@ -344,34 +527,137 @@ def load_game_data(
 
     unit_lines_path = aoe2_path / "resources" / "_common" / "dat" / "unitlines.json"
     unit_lines = read_json_file(unit_lines_path, warnings)
-
     if unit_lines:
         for line in unit_lines.get("UnitLines", []):
             if not isinstance(line, dict):
                 continue
-
             line_name = line.get("Name")
             if not isinstance(line_name, str) or not line_name.strip():
                 continue
-
             for unit_id in line.get("IDChain", []):
                 if isinstance(unit_id, int):
-                    unit_names.setdefault(unit_id, line_name.replace(" Line", ""))
+                    game_data["units"].setdefault(
+                        unit_id, line_name.replace(" Line", "")
+                    )
+                    game_data["objects"].setdefault(
+                        unit_id, line_name.replace(" Line", "")
+                    )
 
     LOGGER.info(
-        "Loaded game data counts: civs=%s techs=%s buildings=%s units=%s",
-        len(civ_names),
-        len(tech_names),
-        len(building_names),
-        len(unit_names),
+        "Loaded local game data counts: civs=%s techs=%s buildings=%s units=%s objects=%s",
+        len(game_data["civilizations"]),
+        len(game_data["technologies"]),
+        len(game_data["buildings"]),
+        len(game_data["units"]),
+        len(game_data["objects"]),
+    )
+    return game_data
+
+
+def augment_game_data_from_mgz_reference(
+    header: JsonDict, game_data: dict[str, Any], warnings: list[JsonDict]
+) -> None:
+    if mgz_get_dataset is None or mgz_get_consts is None:
+        add_warning(
+            warnings,
+            "mgz_reference_unavailable",
+            "mgz.reference is not available, so object/tech names are limited to local game data and fallback IDs.",
+        )
+        return
+
+    try:
+        version = header.get("version")
+        mod = header.get("mod")
+        dataset_id, dataset = mgz_get_dataset(version, mod)
+        consts = mgz_get_consts()
+    except Exception as error:
+        add_warning(
+            warnings,
+            "mgz_reference_load_failed",
+            "mgz.reference data could not be loaded for this replay.",
+            error=str(error),
+            type=type(error).__name__,
+        )
+        return
+
+    for key, value in (dataset.get("civilizations") or {}).items():
+        name = reference_name(value)
+        if name:
+            try:
+                game_data["civilizations"].setdefault(int(key), name)
+            except (TypeError, ValueError):
+                pass
+
+    for key, value in (dataset.get("technologies") or {}).items():
+        name = reference_name(value)
+        if name:
+            try:
+                game_data["technologies"].setdefault(int(key), name)
+            except (TypeError, ValueError):
+                pass
+
+    for key, value in (dataset.get("objects") or {}).items():
+        name = reference_name(value)
+        if name:
+            try:
+                object_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            game_data["objects"].setdefault(object_id, name)
+            game_data["units"].setdefault(object_id, name)
+            if object_id in KNOWN_BUILDING_NAMES_BY_ID:
+                game_data["buildings"].setdefault(object_id, name)
+
+    game_data["reference"] = {
+        "datasetId": dataset_id,
+        "datasetName": reference_name(dataset.get("dataset"))
+        or (dataset.get("dataset") or {}).get("name"),
+        "constsLoaded": bool(consts),
+    }
+
+    LOGGER.info(
+        "After reference augment: civs=%s techs=%s buildings=%s units=%s objects=%s dataset=%s",
+        len(game_data["civilizations"]),
+        len(game_data["technologies"]),
+        len(game_data["buildings"]),
+        len(game_data["units"]),
+        len(game_data["objects"]),
+        dataset_id,
     )
 
-    return {
-        "civilizations": civ_names,
-        "technologies": tech_names,
-        "buildings": building_names,
-        "units": unit_names,
-    }
+
+def id_name(
+    game_data: dict[str, Any], category: str, identifier: Any, fallback_prefix: str
+) -> str:
+    if isinstance(identifier, str) and identifier.isdigit():
+        identifier = int(identifier)
+
+    if not isinstance(identifier, int):
+        return f"{fallback_prefix} {identifier}"
+
+    if category == "technology":
+        return (
+            game_data["technologies"].get(identifier)
+            or KNOWN_TECH_NAMES_BY_ID.get(identifier)
+            or f"Tech {identifier}"
+        )
+
+    if category == "building":
+        return (
+            game_data["buildings"].get(identifier)
+            or game_data["objects"].get(identifier)
+            or KNOWN_BUILDING_NAMES_BY_ID.get(identifier)
+            or f"Building {identifier}"
+        )
+
+    if category == "unit":
+        return (
+            game_data["units"].get(identifier)
+            or game_data["objects"].get(identifier)
+            or f"Unit {identifier}"
+        )
+
+    return str(identifier)
 
 
 def map_name(header: JsonDict) -> tuple[str, int | None]:
@@ -379,7 +665,6 @@ def map_name(header: JsonDict) -> tuple[str, int | None]:
     scenario = header.get("scenario") or {}
 
     candidate_map_id = None
-
     if isinstance(de.get("rms_map_id"), int) and de.get("rms_map_id") in DE_MAP_NAMES:
         candidate_map_id = de.get("rms_map_id")
     elif isinstance(scenario.get("map_id"), int):
@@ -388,12 +673,14 @@ def map_name(header: JsonDict) -> tuple[str, int | None]:
     if candidate_map_id is None:
         return ("Unknown map", None)
 
-    return (
-        DE_MAP_NAMES.get(candidate_map_id)
-        or MAP_NAMES.get(candidate_map_id)
-        or f"Map {candidate_map_id}",
-        candidate_map_id,
-    )
+    label = DE_MAP_NAMES.get(candidate_map_id) or MAP_NAMES.get(candidate_map_id)
+    if label:
+        return (label, candidate_map_id)
+
+    if candidate_map_id == 0:
+        return ("Unknown map", candidate_map_id)
+
+    return (f"Map {candidate_map_id}", candidate_map_id)
 
 
 def game_type_label(header: JsonDict, players: list[JsonDict]) -> str:
@@ -402,13 +689,11 @@ def game_type_label(header: JsonDict, players: list[JsonDict]) -> str:
     base_label = GAME_TYPE_NAMES.get(game_type_id, "Recorded Match")
 
     team_buckets: dict[int, int] = defaultdict(int)
-
     for player in players:
         team = player.get("team")
         team_buckets[team if team is not None else player["slot"]] += 1
 
     team_sizes = sorted(team_buckets.values())
-
     if len(team_sizes) >= 2:
         match_shape = "v".join(str(size) for size in team_sizes)
         return f"{match_shape} {base_label}"
@@ -419,18 +704,13 @@ def game_type_label(header: JsonDict, players: list[JsonDict]) -> str:
 def format_seconds(seconds: int | None) -> str:
     if seconds is None:
         return "unknown"
-
     minutes, remaining = divmod(int(seconds), 60)
     return f"{minutes}:{remaining:02d}"
 
 
 def is_military_unit(unit_name: str) -> bool:
-    if not unit_name:
+    if not unit_name or unit_name.startswith("Unit "):
         return False
-
-    if unit_name.startswith("Unit "):
-        return False
-
     return not any(pattern in unit_name for pattern in CIVILIAN_UNIT_PATTERNS)
 
 
@@ -448,10 +728,8 @@ def add_timeline_event(
         "type": event_type,
         "label": label,
     }
-
     if metadata:
         event["metadata"] = metadata
-
     events.append(event)
 
 
@@ -469,7 +747,6 @@ def infer_results(players: list[JsonDict]) -> tuple[int | None, set[int]]:
     for player in players:
         team_key = player["team"] if player["team"] is not None else player["slot"]
         team_members[team_key].append(player["slot"])
-
         if player.get("resignedAtSeconds") is not None:
             resigned_players.add(player["slot"])
 
@@ -498,10 +775,8 @@ def infer_results(players: list[JsonDict]) -> tuple[int | None, set[int]]:
             if player["slot"] not in resigned_players
         }
         winning_player = next(iter(winning_slots), None)
-
         if winning_player is None:
             return (None, set())
-
         winning_team = next(
             (
                 player["team"] if player["team"] is not None else player["slot"]
@@ -528,17 +803,12 @@ def compare_timing(
     first_value = first.get(field)
     second_value = second.get(field)
     noun = noun or label
-
     if first_value is None or second_value is None:
         return
-
     delta = abs(first_value - second_value)
-
     if delta <= threshold:
         return
-
     faster, slower = (first, second) if first_value < second_value else (second, first)
-
     insights.append(
         {
             "playerSlot": slower["slot"],
@@ -570,7 +840,7 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
         loom_time = player.get("loomTimeSeconds")
         second_tc_time = player.get("firstTownCenterAfterCastleTimeSeconds")
 
-        if feudal_time is not None and feudal_time < 11 * 60:
+        if feudal_time is not None and 4 * 60 <= feudal_time < 11 * 60:
             insights.append(
                 {
                     "playerSlot": player["slot"],
@@ -580,7 +850,7 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
                 }
             )
 
-        if castle_time is not None and castle_time < 20 * 60:
+        if castle_time is not None and 8 * 60 <= castle_time < 20 * 60:
             insights.append(
                 {
                     "playerSlot": player["slot"],
@@ -589,8 +859,17 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
                     "text": f"{player['name']} reached Castle Age at {format_seconds(castle_time)}, which is a strong timing for many standard openings.",
                 }
             )
+        elif castle_time is not None and castle_time < 8 * 60:
+            insights.append(
+                {
+                    "playerSlot": player["slot"],
+                    "category": "timing",
+                    "severity": "info",
+                    "text": f"{player['name']} has a detected Castle Age timestamp at {format_seconds(castle_time)}. This may be a starting-age/restored-game artifact or a parser timing artifact rather than a normal age-up.",
+                }
+            )
 
-        if castle_time is not None and second_tc_time is None:
+        if castle_time is not None and castle_time >= 8 * 60 and second_tc_time is None:
             insights.append(
                 {
                     "playerSlot": player["slot"],
@@ -600,7 +879,7 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
                 }
             )
 
-        if first_military_time is None:
+        if player["participantType"] == "human" and first_military_time is None:
             insights.append(
                 {
                     "playerSlot": player["slot"],
@@ -610,7 +889,7 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
                 }
             )
 
-        if loom_time is None:
+        if player["participantType"] == "human" and loom_time is None:
             insights.append(
                 {
                     "playerSlot": player["slot"],
@@ -622,24 +901,11 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
 
     if len(comparable_players) == 2:
         first, second = comparable_players
-
         compare_timing(
-            insights,
-            "Feudal Age",
-            "feudalTimeSeconds",
-            30,
-            first,
-            second,
-            "timing",
+            insights, "Feudal Age", "feudalTimeSeconds", 30, first, second, "timing"
         )
         compare_timing(
-            insights,
-            "Castle Age",
-            "castleTimeSeconds",
-            60,
-            first,
-            second,
-            "timing",
+            insights, "Castle Age", "castleTimeSeconds", 60, first, second, "timing"
         )
         compare_timing(
             insights,
@@ -652,22 +918,14 @@ def build_insights(players: list[JsonDict]) -> list[JsonDict]:
             noun="their first military building",
         )
         compare_timing(
-            insights,
-            "Loom",
-            "loomTimeSeconds",
-            30,
-            first,
-            second,
-            "economy",
+            insights, "Loom", "loomTimeSeconds", 30, first, second, "economy"
         )
 
     return insights
 
 
 def parse_participants(
-    header: JsonDict,
-    game_data: dict[str, dict[int, str]],
-    warnings: list[JsonDict],
+    header: JsonDict, game_data: dict[str, Any], warnings: list[JsonDict]
 ) -> list[JsonDict]:
     de_players = (header.get("de") or {}).get("players") or []
     participants: list[JsonDict] = []
@@ -686,14 +944,14 @@ def parse_participants(
         name = decode_text(raw_player.get("name")).strip()
         ai_name = decode_text(raw_player.get("ai_name")).strip()
         participant_name = name or ai_name
-
         slot = raw_player.get("number")
+
         if not participant_name or not isinstance(slot, int) or slot <= 0:
             add_warning(
                 warnings,
                 "skipped_invalid_player",
                 "A player entry was skipped because it had no name or valid slot.",
-                rawPlayer=raw_player,
+                rawPlayer=to_jsonable(raw_player),
             )
             continue
 
@@ -710,8 +968,7 @@ def parse_participants(
                 "slot": slot,
                 "name": participant_name,
                 "civilization": game_data["civilizations"].get(
-                    civilization_id,
-                    f"Civ {civilization_id}",
+                    civilization_id, f"Civ {civilization_id}"
                 ),
                 "civilizationId": civilization_id,
                 "team": raw_player.get("team_id"),
@@ -735,6 +992,7 @@ def parse_participants(
                     "makeActions": 0,
                     "moveActions": 0,
                     "otherActions": 0,
+                    "actionTypes": {},
                 },
                 "detectedTimings": {
                     "technologies": {},
@@ -745,9 +1003,7 @@ def parse_participants(
         )
 
     participants.sort(key=lambda player: player["slot"])
-
     LOGGER.info("Parsed participants: %s", len(participants))
-
     return participants
 
 
@@ -759,6 +1015,7 @@ def update_action_summary(player: JsonDict, action_type: Any) -> None:
     action_name = safe_enum_name(action_type)
     summary = player["commandSummary"]
     summary["totalActions"] += 1
+    summary["actionTypes"][action_name] = summary["actionTypes"].get(action_name, 0) + 1
 
     if action_name == "BUILD":
         summary["buildActions"] += 1
@@ -766,10 +1023,42 @@ def update_action_summary(player: JsonDict, action_type: Any) -> None:
         summary["researchActions"] += 1
     elif action_name == "MAKE":
         summary["makeActions"] += 1
-    elif action_name in {"MOVE", "ORDER", "WAYPOINT"}:
+    elif action_name in {
+        "MOVE",
+        "ORDER",
+        "WAYPOINT",
+        "MULTI_GATHERPOINT",
+        "GATHER_POINT",
+        "PATROL",
+    }:
         summary["moveActions"] += 1
     else:
         summary["otherActions"] += 1
+
+
+def record_named_timing(
+    bucket: dict[str, JsonDict],
+    name: str,
+    time_seconds: int,
+    identifier: Any | None = None,
+    payload: Any | None = None,
+) -> None:
+    entry = bucket.setdefault(
+        name,
+        {
+            "count": 0,
+            "firstTimeSeconds": time_seconds,
+            "lastTimeSeconds": time_seconds,
+            "ids": [],
+        },
+    )
+    entry["count"] += 1
+    entry["firstTimeSeconds"] = min(entry["firstTimeSeconds"], time_seconds)
+    entry["lastTimeSeconds"] = max(entry["lastTimeSeconds"], time_seconds)
+    if identifier is not None and identifier not in entry["ids"]:
+        entry["ids"].append(identifier)
+    if payload is not None and "firstPayload" not in entry:
+        entry["firstPayload"] = to_jsonable(payload)
 
 
 def finalize_player_timings(
@@ -780,35 +1069,29 @@ def finalize_player_timings(
 ) -> None:
     for player in participants:
         slot = player["slot"]
-
         player["feudalTimeSeconds"] = age_ups.get(slot, {}).get(
             "Feudal Age"
         ) or age_research_starts.get(slot, {}).get("Feudal Age")
-
         player["castleTimeSeconds"] = age_ups.get(slot, {}).get(
             "Castle Age"
         ) or age_research_starts.get(slot, {}).get("Castle Age")
-
         player["imperialTimeSeconds"] = age_ups.get(slot, {}).get(
             "Imperial Age"
         ) or age_research_starts.get(slot, {}).get("Imperial Age")
 
         castle_time = player["castleTimeSeconds"]
-
         if castle_time is not None:
             tc_after_castle = [
                 build_time
                 for build_time in tc_build_times.get(slot, [])
                 if castle_time < build_time <= castle_time + 180
             ]
-
             if tc_after_castle:
                 player["firstTownCenterAfterCastleTimeSeconds"] = min(tc_after_castle)
 
 
 def normalize_player_teams(participants: list[JsonDict]) -> None:
     team_map = normalize_team_ids(participants)
-
     for player in participants:
         if player["team"] is not None:
             player["team"] = team_map.get(player["team"], player["team"])
@@ -816,27 +1099,357 @@ def normalize_player_teams(participants: list[JsonDict]) -> None:
 
 def apply_results(participants: list[JsonDict]) -> tuple[int | None, set[int]]:
     winning_team, winning_slots = infer_results(participants)
-
     for player in participants:
         if player["slot"] in winning_slots:
             player["result"] = "win"
         elif player.get("resignedAtSeconds") is not None:
             player["result"] = "loss"
-
     return winning_team, winning_slots
+
+
+def apply_estimated_results(
+    participants: list[JsonDict],
+    winning_team: int,
+    winning_slots: set[int],
+) -> None:
+    for player in participants:
+        if player["slot"] in winning_slots:
+            player["result"] = "win"
+        elif player.get("team") is not None:
+            player["result"] = "loss"
+
+
+def estimate_results_from_final_sync(
+    participants: list[JsonDict],
+    player_timeseries: dict[int, list[JsonDict]],
+) -> JsonDict | None:
+    team_metrics: dict[int, JsonDict] = {}
+
+    for player in participants:
+        slot = player["slot"]
+        team = player.get("team")
+        if team is None:
+            continue
+
+        rows = player_timeseries.get(slot) or []
+        if not rows:
+            continue
+
+        latest = rows[-1]
+        total_resources = latest.get("totalResources")
+        object_count = latest.get("objectCount")
+        if not isinstance(total_resources, (int, float)) and not isinstance(
+            object_count, (int, float)
+        ):
+            continue
+
+        metrics = team_metrics.setdefault(
+            team,
+            {
+                "team": team,
+                "playerSlots": [],
+                "totalResources": 0,
+                "objectCount": 0,
+                "score": 0,
+            },
+        )
+        metrics["playerSlots"].append(slot)
+        metrics["totalResources"] += int(total_resources or 0)
+        metrics["objectCount"] += int(object_count or 0)
+
+    for metrics in team_metrics.values():
+        # This is not the official AoE score. It is only a fallback signal when
+        # the replay has no explicit resign/victory result in the parsed stream.
+        metrics["score"] = metrics["totalResources"] + metrics["objectCount"] * 25
+
+    ranked_teams = sorted(
+        team_metrics.values(),
+        key=lambda metrics: metrics["score"],
+        reverse=True,
+    )
+
+    if len(ranked_teams) < 2:
+        return None
+
+    leader = ranked_teams[0]
+    runner_up = ranked_teams[1]
+    if leader["score"] <= 0 or runner_up["score"] <= 0:
+        return None
+
+    score_ratio = leader["score"] / runner_up["score"]
+    if score_ratio < 1.15:
+        return None
+
+    confidence = "medium" if score_ratio >= 1.35 else "low"
+    winning_team = int(leader["team"])
+    winning_slots = {
+        player["slot"] for player in participants if player.get("team") == winning_team
+    }
+
+    return {
+        "winningTeam": winning_team,
+        "winningPlayerSlots": sorted(winning_slots),
+        "source": "final_sync_stats_estimate",
+        "confidence": confidence,
+        "explanation": (
+            "No explicit victory/resign result was parsed. Winner was estimated "
+            "from the final sync-stat resource and object-count snapshot."
+        ),
+        "scoreRatio": round(score_ratio, 3),
+        "teamMetrics": ranked_teams,
+    }
 
 
 def parse_chat_payload(payload: Any) -> JsonDict:
     decoded_chat = decode_text(payload)
-
     try:
         parsed_chat = json.loads(decoded_chat)
         if isinstance(parsed_chat, dict):
             return parsed_chat
     except json.JSONDecodeError:
         pass
-
     return {"message": decoded_chat}
+
+
+def dig(data: Any, *keys: str, default: Any = None) -> Any:
+    value = data
+    for key in keys:
+        if not isinstance(value, dict):
+            return default
+        value = value.get(key)
+        if value is None:
+            return default
+    return value
+
+
+def build_header_summary(header: JsonDict) -> JsonDict:
+    metadata = header.get("metadata") or {}
+    lobby = header.get("lobby") or {}
+    scenario = header.get("scenario") or {}
+    de = header.get("de") or {}
+    map_data = header.get("map") or {}
+
+    starting_age_id = de.get("starting_age_id")
+    return {
+        "gameVersion": decode_text(header.get("game_version")) or None,
+        "saveVersion": header.get("save_version"),
+        "logVersion": header.get("log_version"),
+        "versionKind": (
+            safe_enum_name(header.get("version"))
+            if header.get("version") is not None
+            else None
+        ),
+        "mapSeed": lobby.get("seed"),
+        "revealMapId": lobby.get("reveal_map_id"),
+        "population": lobby.get("population"),
+        "speed": speed_label(metadata.get("speed")),
+        "rawSpeed": metadata.get("speed"),
+        "ownerId": metadata.get("owner_id"),
+        "scenarioMapId": scenario.get("map_id"),
+        "scenarioFilename": decode_text(scenario.get("scenario_filename")) or None,
+        "lobbyName": decode_text(de.get("lobby"))
+        or decode_text(de.get("lobby_name"))
+        or None,
+        "modName": decode_text(de.get("mod")) or None,
+        "rmsMapId": de.get("rms_map_id"),
+        "rmsModId": de.get("rms_mod_id"),
+        "difficultyId": de.get("difficulty_id") or scenario.get("difficulty_id"),
+        "startingAgeId": starting_age_id,
+        "startingAge": STARTING_AGE_NAMES.get(starting_age_id),
+        "allTechnologies": de.get("all_technologies"),
+        "teamTogether": de.get("team_together"),
+        "lockSpeed": de.get("lock_speed"),
+        "mapDimension": map_data.get("dimension"),
+        "restoreTime": map_data.get("restore_time"),
+        "timestamp": de.get("timestamp"),
+    }
+
+
+def header_structure(value: Any, *, depth: int = 0, max_depth: int = 4) -> Any:
+    if depth >= max_depth:
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {
+            str(key): header_structure(item, depth=depth + 1, max_depth=max_depth)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        if not value:
+            return []
+        return [
+            header_structure(value[0], depth=depth + 1, max_depth=max_depth),
+            f"... {len(value)} item(s)",
+        ]
+    return type(value).__name__
+
+
+def update_counter(target: dict[str, int], key: Any) -> None:
+    label = safe_enum_name(key)
+    target[label] = target.get(label, 0) + 1
+
+
+def try_build_model_bundle(
+    replay_path: Path, include_model: bool, warnings: list[JsonDict]
+) -> JsonDict:
+    if not include_model:
+        return {"available": False, "skipped": True, "reason": "disabled_by_cli"}
+    if mgz_parse_match is None or mgz_serialize_model is None:
+        return {"available": False, "skipped": True, "reason": "mgz.model_unavailable"}
+
+    started = perf_counter()
+    try:
+        with replay_path.open("rb") as replay_file:
+            match = mgz_parse_match(replay_file)
+        serialized = mgz_serialize_model(match)
+        return {
+            "available": True,
+            "parseMs": round((perf_counter() - started) * 1000, 2),
+            "data": to_jsonable(serialized, max_depth=30),
+        }
+    except Exception as error:
+        add_warning(
+            warnings,
+            "mgz_model_parse_failed",
+            "mgz.model.parse_match failed. Fast extraction may still provide data.",
+            error=str(error),
+            type=type(error).__name__,
+        )
+        return {
+            "available": False,
+            "error": str(error),
+            "type": type(error).__name__,
+            "parseMs": round((perf_counter() - started) * 1000, 2),
+        }
+
+
+def call_summary_method(summary: Any, method_name: str) -> Any:
+    method = getattr(summary, method_name)
+    return method()
+
+
+def try_build_summary_bundle(
+    replay_path: Path, include_summary: bool, warnings: list[JsonDict]
+) -> JsonDict:
+    if not include_summary:
+        return {"available": False, "skipped": True, "reason": "disabled_by_cli"}
+    if MgzSummary is None:
+        return {
+            "available": False,
+            "skipped": True,
+            "reason": "mgz.summary_unavailable",
+        }
+
+    started = perf_counter()
+    try:
+        with replay_path.open("rb") as replay_file:
+            summary = MgzSummary(replay_file)
+
+        methods = [
+            "get_version",
+            "get_duration",
+            "get_restored",
+            "get_completed",
+            "get_played",
+            "get_owner",
+            "get_encoding",
+            "get_language",
+            "get_platform",
+            "get_settings",
+            "get_dataset",
+            "get_diplomacy",
+            "get_teams",
+            "get_players",
+            "get_objects",
+            "get_map",
+            "get_chat",
+            "get_postgame",
+            "get_hash",
+            "get_file_hash",
+            "get_mirror",
+        ]
+
+        data: JsonDict = {}
+        errors: JsonDict = {}
+        for method_name in methods:
+            if not hasattr(summary, method_name):
+                continue
+            try:
+                data[
+                    method_name[4:] if method_name.startswith("get_") else method_name
+                ] = to_jsonable(
+                    call_summary_method(summary, method_name),
+                    max_depth=25,
+                )
+            except Exception as error:
+                errors[method_name] = {
+                    "error": str(error),
+                    "type": type(error).__name__,
+                }
+
+        return {
+            "available": True,
+            "parseMs": round((perf_counter() - started) * 1000, 2),
+            "data": data,
+            "methodErrors": errors,
+        }
+    except Exception as error:
+        add_warning(
+            warnings,
+            "mgz_summary_parse_failed",
+            "mgz.summary.Summary failed. Fast extraction may still provide data.",
+            error=str(error),
+            type=type(error).__name__,
+        )
+        return {
+            "available": False,
+            "error": str(error),
+            "type": type(error).__name__,
+            "parseMs": round((perf_counter() - started) * 1000, 2),
+        }
+
+
+def process_sync_stats(
+    payload: Any,
+    current_second: int,
+    operation_index: int,
+    sync_stat_rows: list[JsonDict],
+    player_timeseries: dict[int, list[JsonDict]],
+    max_sync_stats: int,
+    truncation: JsonDict,
+) -> None:
+    if not isinstance(payload, (tuple, list)) or len(payload) < 3:
+        return
+
+    stat_row = payload[2]
+    if not stat_row:
+        return
+
+    row: JsonDict = {
+        "operationIndex": operation_index,
+        "timeSeconds": current_second,
+        "raw": to_jsonable(stat_row),
+    }
+
+    if isinstance(stat_row, dict):
+        if "current_time" in stat_row:
+            row["currentTimeMilliseconds"] = stat_row.get("current_time")
+        players: JsonDict = {}
+        for key, stats in stat_row.items():
+            if not isinstance(key, int) or not isinstance(stats, dict):
+                continue
+            player_row = {
+                "timeSeconds": current_second,
+                "totalResources": stats.get("total_res"),
+                "objectCount": stats.get("obj_count"),
+                "raw": to_jsonable(stats),
+            }
+            players[str(key)] = player_row
+            if append_limited(player_timeseries[key], player_row, max_sync_stats):
+                pass
+        row["players"] = players
+
+    if not append_limited(sync_stat_rows, row, max_sync_stats):
+        truncation["syncStats"] = truncation.get("syncStats", 0) + 1
 
 
 def parse_replay(args: argparse.Namespace) -> JsonDict:
@@ -845,13 +1458,12 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
     replay_path = Path(args.replay_path)
     warnings: list[JsonDict] = []
     parse_errors: list[JsonDict] = []
+    truncation: JsonDict = {}
 
     if not replay_path.exists():
         raise FileNotFoundError(f"Replay file not found: {replay_path}")
-
     if not replay_path.is_file():
         raise ValueError(f"Replay path is not a file: {replay_path}")
-
     if replay_path.suffix.lower() != ".aoe2record":
         add_warning(
             warnings,
@@ -862,6 +1474,7 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
         )
 
     file_size = replay_path.stat().st_size
+    file_sha1 = hashlib.sha1(replay_path.read_bytes()).hexdigest()
 
     LOGGER.info(
         "Starting replay parse: path=%s size=%s replayId=%s",
@@ -873,13 +1486,12 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
     game_data = load_game_data(args.aoe2_path, warnings)
 
     header_parse_started_at = perf_counter()
-
     with replay_path.open("rb") as replay_file:
         header = parse_header(replay_file)
-
     header_parse_ms = round((perf_counter() - header_parse_started_at) * 1000, 2)
-
     LOGGER.info("Header parsed in %sms", header_parse_ms)
+
+    augment_game_data_from_mgz_reference(header, game_data, warnings)
 
     participants = parse_participants(header, game_data, warnings)
     players_by_slot = {player["slot"]: player for player in participants}
@@ -887,9 +1499,32 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
     operation_counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
     action_counts_by_player: dict[int, Counter[str]] = defaultdict(Counter)
+    operation_samples_by_type: dict[str, list[JsonDict]] = defaultdict(list)
 
     chats: list[JsonDict] = []
     events: list[JsonDict] = []
+    raw_actions: list[JsonDict] = []
+    viewlocks: list[JsonDict] = []
+    sync_stat_rows: list[JsonDict] = []
+    player_timeseries: dict[int, list[JsonDict]] = defaultdict(list)
+    postgame_payloads: list[JsonDict] = []
+
+    player_command_data: dict[int, JsonDict] = {
+        player["slot"]: {
+            "actionCounts": {},
+            "researches": {},
+            "buildings": {},
+            "units": {},
+            "tributes": [],
+            "positions": [],
+            "commandIdCounts": {},
+            "orderIdCounts": {},
+            "resourceIdCounts": {},
+            "formationIdCounts": {},
+            "stanceIdCounts": {},
+        }
+        for player in participants
+    }
 
     age_ups: dict[int, dict[str, int]] = defaultdict(dict)
     age_research_starts: dict[int, dict[str, int]] = defaultdict(dict)
@@ -930,7 +1565,6 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 break
             except Exception as error:
                 skipped_operations += 1
-
                 add_parse_error(
                     parse_errors,
                     "operation_parse_failed",
@@ -944,6 +1578,17 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
 
             operation_name = safe_enum_name(op_type)
             operation_counts[operation_name] += 1
+            if (
+                len(operation_samples_by_type[operation_name])
+                < args.max_operation_samples
+            ):
+                operation_samples_by_type[operation_name].append(
+                    {
+                        "operationIndex": operation_index,
+                        "offset": current_offset,
+                        "payload": to_jsonable(payload, max_depth=8),
+                    }
+                )
 
             if args.debug and operation_index % 1000 == 0:
                 LOGGER.debug(
@@ -956,45 +1601,73 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
             if op_type == Operation.SYNC:
                 try:
                     duration_ms += int(payload[0])
+                    current_second = int(duration_ms / 1000)
+                    process_sync_stats(
+                        payload,
+                        current_second,
+                        operation_index,
+                        sync_stat_rows,
+                        player_timeseries,
+                        args.max_sync_stats,
+                        truncation,
+                    )
                 except Exception as error:
                     add_warning(
                         warnings,
                         "sync_payload_invalid",
-                        "SYNC payload did not contain a valid time delta.",
+                        "SYNC payload did not contain a valid time delta or stats row.",
                         operationIndex=operation_index,
                         offset=current_offset,
-                        payload=safe_json_dumps(payload),
+                        payload=to_jsonable(payload, max_depth=8),
                         error=str(error),
                     )
                 continue
 
             current_second = int(duration_ms / 1000)
 
-            if op_type == Operation.CHAT:
-                parsed_chat = parse_chat_payload(payload)
+            if op_type == Operation.VIEWLOCK:
+                item = {
+                    "operationIndex": operation_index,
+                    "offset": current_offset,
+                    "timeSeconds": current_second,
+                    "payload": to_jsonable(payload, max_depth=8),
+                }
+                if not append_limited(viewlocks, item, args.max_viewlocks):
+                    truncation["viewlocks"] = truncation.get("viewlocks", 0) + 1
+                continue
 
-                chat_player = parsed_chat.get("player")
-                chat_message = str(parsed_chat.get("message", "")).strip()
-
-                chats.append(
+            if op_type == Operation.POSTGAME:
+                postgame_payloads.append(
                     {
+                        "operationIndex": operation_index,
+                        "offset": current_offset,
                         "timeSeconds": current_second,
-                        "playerSlot": (
-                            chat_player if isinstance(chat_player, int) else None
-                        ),
-                        "message": chat_message or decode_text(payload),
+                        "payload": to_jsonable(payload, max_depth=20),
                     }
                 )
+                continue
+
+            if op_type == Operation.CHAT:
+                parsed_chat = parse_chat_payload(payload)
+                chat_player = parsed_chat.get("player")
+                chat_message = str(parsed_chat.get("message", "")).strip()
+                chat_item = {
+                    "operationIndex": operation_index,
+                    "offset": current_offset,
+                    "timeSeconds": current_second,
+                    "playerSlot": chat_player if isinstance(chat_player, int) else None,
+                    "message": chat_message or decode_text(payload),
+                    "raw": to_jsonable(parsed_chat, max_depth=10),
+                }
+                if not append_limited(chats, chat_item, args.max_chats):
+                    truncation["chats"] = truncation.get("chats", 0) + 1
 
                 age_match = SYSTEM_AGE_UP_RE.search(chat_message)
-
                 if age_match:
                     player_slot = int(age_match.group(1))
                     age_label = AGE_MESSAGES.get(age_match.group(2))
-
                     if age_label:
                         age_ups[player_slot][age_label] = current_second
-
                         add_timeline_event(
                             events,
                             current_second,
@@ -1004,6 +1677,7 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                             {
                                 "source": "chat",
                                 "age": age_label,
+                                "operationIndex": operation_index,
                             },
                         )
                 continue
@@ -1020,7 +1694,7 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                     "ACTION payload was not a two-item action tuple.",
                     operationIndex=operation_index,
                     offset=current_offset,
-                    payload=safe_json_dumps(payload),
+                    payload=to_jsonable(payload, max_depth=8),
                 )
                 continue
 
@@ -1035,43 +1709,85 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                     operationIndex=operation_index,
                     offset=current_offset,
                     actionType=action_name,
-                    actionData=safe_json_dumps(action_data),
+                    actionData=to_jsonable(action_data, max_depth=8),
                 )
                 continue
 
             player_slot = action_data.get("player_id")
             player = players_by_slot.get(player_slot)
+            command_data = (
+                player_command_data.get(player_slot)
+                if isinstance(player_slot, int)
+                else None
+            )
+
+            raw_action = {
+                "operationIndex": operation_index,
+                "offset": current_offset,
+                "timeSeconds": current_second,
+                "playerSlot": player_slot if isinstance(player_slot, int) else None,
+                "actionType": action_name,
+                "payload": to_jsonable(action_data, max_depth=12),
+            }
+            if not append_limited(raw_actions, raw_action, args.max_raw_actions):
+                truncation["rawActions"] = truncation.get("rawActions", 0) + 1
 
             if player is not None:
                 action_counts_by_player[player_slot][action_name] += 1
                 update_action_summary(player, action_type)
 
-            if action_type == Action.RESIGN and player is not None:
-                player["resignedAtSeconds"] = current_second
+            if command_data is not None:
+                update_counter(command_data["actionCounts"], action_name)
+                for field, bucket_name in (
+                    ("command_id", "commandIdCounts"),
+                    ("order_id", "orderIdCounts"),
+                    ("resource_id", "resourceIdCounts"),
+                    ("formation_id", "formationIdCounts"),
+                    ("stance_id", "stanceIdCounts"),
+                ):
+                    if field in action_data:
+                        update_counter(
+                            command_data[bucket_name], action_data.get(field)
+                        )
+                if "x" in action_data and "y" in action_data:
+                    append_limited(
+                        command_data["positions"],
+                        {
+                            "timeSeconds": current_second,
+                            "actionType": action_name,
+                            "x": action_data.get("x"),
+                            "y": action_data.get("y"),
+                        },
+                        args.max_positions_per_player,
+                    )
 
+            if action_name == "RESIGN" and player is not None:
+                player["resignedAtSeconds"] = current_second
                 add_timeline_event(
                     events,
                     current_second,
                     player_slot,
                     "resign",
                     f"{player['name']} resigned.",
-                    {
-                        "source": "action",
-                    },
+                    {"source": "action", "operationIndex": operation_index},
                 )
                 continue
 
-            if action_type == Action.RESEARCH and player is not None:
+            if action_name == "RESEARCH" and player is not None:
                 technology_id = action_data.get("technology_id")
-                tech_name = game_data["technologies"].get(
-                    technology_id,
-                    f"Tech {technology_id}",
-                )
+                tech_name = id_name(game_data, "technology", technology_id, "Tech")
 
                 player["detectedTimings"]["technologies"].setdefault(
-                    tech_name,
-                    current_second,
+                    tech_name, current_second
                 )
+                if command_data is not None:
+                    record_named_timing(
+                        command_data["researches"],
+                        tech_name,
+                        current_second,
+                        technology_id,
+                        action_data,
+                    )
 
                 if tech_name == "Loom" and player["loomTimeSeconds"] is None:
                     player["loomTimeSeconds"] = current_second
@@ -1090,21 +1806,26 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                             "source": "action",
                             "technologyId": technology_id,
                             "technologyName": tech_name,
+                            "operationIndex": operation_index,
                         },
                     )
                 continue
 
-            if action_type == Action.BUILD and player is not None:
+            if action_name == "BUILD" and player is not None:
                 building_id = action_data.get("building_id")
-                building_name = game_data["buildings"].get(
-                    building_id,
-                    f"Building {building_id}",
-                )
+                building_name = id_name(game_data, "building", building_id, "Building")
 
                 player["detectedTimings"]["buildings"].setdefault(
-                    building_name,
-                    current_second,
+                    building_name, current_second
                 )
+                if command_data is not None:
+                    record_named_timing(
+                        command_data["buildings"],
+                        building_name,
+                        current_second,
+                        building_id,
+                        action_data,
+                    )
 
                 if building_name in KEY_BUILDING_NAMES:
                     add_timeline_event(
@@ -1117,6 +1838,9 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                             "source": "action",
                             "buildingId": building_id,
                             "buildingName": building_name,
+                            "operationIndex": operation_index,
+                            "x": action_data.get("x"),
+                            "y": action_data.get("y"),
                         },
                     )
 
@@ -1125,74 +1849,123 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                     and player["firstMilitaryBuildingTimeSeconds"] is None
                 ):
                     player["firstMilitaryBuildingTimeSeconds"] = current_second
-
                 if (
                     building_name == "Market"
                     and player["firstMarketTimeSeconds"] is None
                 ):
                     player["firstMarketTimeSeconds"] = current_second
-
                 if (
                     building_name == "Blacksmith"
                     and player["firstBlacksmithTimeSeconds"] is None
                 ):
                     player["firstBlacksmithTimeSeconds"] = current_second
-
                 if (
                     building_name == "Castle"
                     and player["firstCastleTimeSeconds"] is None
                 ):
                     player["firstCastleTimeSeconds"] = current_second
-
                 if building_name == "Town Center":
                     tc_build_times[player_slot].append(current_second)
-
                 continue
 
-            if action_type == Action.MAKE and player is not None:
+            if action_name == "MAKE" and player is not None:
                 unit_id = action_data.get("unit_id")
-                unit_name = game_data["units"].get(unit_id, f"Unit {unit_id}")
+                unit_name = id_name(game_data, "unit", unit_id, "Unit")
 
-                player["detectedTimings"]["units"].setdefault(
-                    unit_name,
-                    current_second,
-                )
+                player["detectedTimings"]["units"].setdefault(unit_name, current_second)
+                if command_data is not None:
+                    record_named_timing(
+                        command_data["units"],
+                        unit_name,
+                        current_second,
+                        unit_id,
+                        action_data,
+                    )
 
                 if (
                     is_military_unit(unit_name)
                     and player["firstMilitaryUnitTimeSeconds"] is None
                 ):
                     player["firstMilitaryUnitTimeSeconds"] = current_second
-
                     add_timeline_event(
                         events,
                         current_second,
                         player_slot,
                         "unit",
-                        f"{player['name']} completed {unit_name}.",
+                        f"{player['name']} queued/completed {unit_name}.",
                         {
                             "source": "action",
                             "unitId": unit_id,
                             "unitName": unit_name,
+                            "operationIndex": operation_index,
                         },
                     )
+                continue
+
+            if action_name == "TRIBUTE" and command_data is not None:
+                append_limited(
+                    command_data["tributes"],
+                    {
+                        "timeSeconds": current_second,
+                        "payload": to_jsonable(action_data, max_depth=10),
+                    },
+                    args.max_tributes_per_player,
+                )
 
     operations_parse_ms = round(
         (perf_counter() - operations_parse_started_at) * 1000, 2
     )
 
-    finalize_player_timings(
-        participants,
-        age_ups,
-        age_research_starts,
-        tc_build_times,
-    )
-
+    finalize_player_timings(participants, age_ups, age_research_starts, tc_build_times)
     normalize_player_teams(participants)
     winning_team, winning_slots = apply_results(participants)
+    result_inference: JsonDict = {
+        "source": "explicit_resign" if winning_team is not None else "unknown",
+        "confidence": "high" if winning_team is not None else None,
+        "explanation": (
+            "Winner inferred from parsed resign actions."
+            if winning_team is not None
+            else "No explicit victory or resign result was found in the parsed replay stream."
+        ),
+    }
+
+    if winning_team is None:
+        estimated_result = estimate_results_from_final_sync(
+            participants,
+            player_timeseries,
+        )
+        if estimated_result is not None:
+            winning_team = estimated_result["winningTeam"]
+            winning_slots = set(estimated_result["winningPlayerSlots"])
+            apply_estimated_results(participants, winning_team, winning_slots)
+            result_inference = estimated_result
+            add_warning(
+                warnings,
+                "result_estimated_from_final_sync_stats",
+                "The replay did not expose an explicit winner, so the result was estimated from final sync stats.",
+                winningTeam=winning_team,
+                confidence=estimated_result.get("confidence"),
+                scoreRatio=estimated_result.get("scoreRatio"),
+            )
 
     map_label, map_id = map_name(header)
     duration_seconds = int(duration_ms / 1000)
+    header_summary = build_header_summary(header)
+
+    insights = build_insights(participants)
+    if result_inference.get("source") == "final_sync_stats_estimate":
+        insights.insert(
+            0,
+            {
+                "playerSlot": None,
+                "category": "result",
+                "severity": "warning",
+                "text": (
+                    f"Winner is estimated as Team {winning_team} from final sync stats "
+                    "because the replay did not expose an explicit victory or resign result."
+                ),
+            },
+        )
 
     match = {
         "id": args.replay_id or replay_path.stem,
@@ -1207,24 +1980,38 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
         "schemaVersion": UPLOAD_REPORT_SCHEMA_VERSION,
         "winningTeam": winning_team,
         "winningPlayerSlots": sorted(winning_slots),
+        "resultSource": result_inference.get("source"),
+        "resultConfidence": result_inference.get("confidence"),
+        "resultExplanation": result_inference.get("explanation"),
     }
 
     sorted_events = sorted(
         events,
-        key=lambda event: (event["timeSeconds"], event["playerSlot"] or 0),
+        key=lambda event: (
+            event["timeSeconds"],
+            event["playerSlot"] or 0,
+            event["type"],
+        ),
     )
+
+    visible_events = limited_items(sorted_events, int(args.max_events))
 
     total_parse_ms = round((perf_counter() - parse_started_at) * 1000, 2)
 
-    max_events = max(0, int(args.max_events))
-    visible_events = sorted_events if max_events == 0 else sorted_events[:max_events]
+    # Optional heavier parsers after the fast pass. Their errors are warnings;
+    # they should not block the report.
+    model_bundle = try_build_model_bundle(replay_path, not args.no_model, warnings)
+    summary_bundle = try_build_summary_bundle(
+        replay_path, not args.no_summary, warnings
+    )
 
     report = {
         "ok": True,
+        "partial": False,
         "match": match,
         "players": participants,
         "events": visible_events,
-        "insights": build_insights(participants),
+        "insights": insights,
         "rawInspection": {
             "parserVersion": PARSER_VERSION,
             "schemaVersion": UPLOAD_REPORT_SCHEMA_VERSION,
@@ -1235,14 +2022,16 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 "stem": replay_path.stem,
                 "suffix": replay_path.suffix,
                 "sizeBytes": file_size,
+                "sha1": file_sha1,
             },
             "diagnostics": {
                 "warnings": warnings,
                 "parseErrors": parse_errors,
+                "truncation": truncation,
                 "timingsMs": {
                     "headerParse": header_parse_ms,
                     "operationsParse": operations_parse_ms,
-                    "totalParse": total_parse_ms,
+                    "totalParseBeforeModelSummary": total_parse_ms,
                 },
                 "operationIndex": operation_index,
                 "skippedOperations": skipped_operations,
@@ -1253,12 +2042,15 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 "timelineEventsTotal": len(sorted_events),
                 "timelineEventsCaptured": len(visible_events),
                 "timelineEventsTruncated": len(visible_events) < len(sorted_events),
+                "resultInference": result_inference,
                 "gameDataCounts": {
                     "civilizations": len(game_data["civilizations"]),
                     "technologies": len(game_data["technologies"]),
                     "buildings": len(game_data["buildings"]),
                     "units": len(game_data["units"]),
+                    "objects": len(game_data["objects"]),
                 },
+                "gameDataReference": game_data.get("reference"),
             },
             "operationCounts": dict(operation_counts.most_common()),
             "actionCounts": dict(action_counts.most_common()),
@@ -1266,32 +2058,48 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 str(player_slot): dict(counter.most_common())
                 for player_slot, counter in action_counts_by_player.items()
             },
-            "chats": chats[: args.max_chats],
-            "headerSummary": {
-                "mapSeed": (header.get("lobby") or {}).get("seed"),
-                "revealMapId": (header.get("lobby") or {}).get("reveal_map_id"),
-                "population": (header.get("lobby") or {}).get("population"),
-                "speed": speed_label((header.get("metadata") or {}).get("speed")),
-                "scenarioMapId": (header.get("scenario") or {}).get("map_id"),
-                "scenarioFilename": decode_text(
-                    (header.get("scenario") or {}).get("scenario_filename")
-                )
-                or None,
-                "lobbyName": decode_text((header.get("de") or {}).get("lobby")) or None,
-                "modName": decode_text((header.get("de") or {}).get("mod")) or None,
-                "rmsMapId": (header.get("de") or {}).get("rms_map_id"),
+            "playerCommandData": {
+                str(slot): data for slot, data in player_command_data.items()
             },
+            "chats": chats,
+            "headerSummary": header_summary,
+            "extracted": {
+                "eventsAllCount": len(sorted_events),
+                "rawActions": raw_actions,
+                "rawActionsCountReturned": len(raw_actions),
+                "rawActionsTruncatedCount": truncation.get("rawActions", 0),
+                "viewlocks": viewlocks,
+                "viewlocksCountReturned": len(viewlocks),
+                "viewlocksTruncatedCount": truncation.get("viewlocks", 0),
+                "syncStats": sync_stat_rows,
+                "syncStatsCountReturned": len(sync_stat_rows),
+                "syncStatsTruncatedCount": truncation.get("syncStats", 0),
+                "playerTimeseries": {
+                    str(slot): rows for slot, rows in player_timeseries.items()
+                },
+                "postgame": postgame_payloads,
+                "operationSamplesByType": dict(operation_samples_by_type),
+            },
+            "headerStructure": header_structure(header),
+            "header": (
+                None
+                if args.no_header
+                else to_jsonable(header, max_depth=args.header_depth)
+            ),
+            "model": model_bundle,
+            "summary": summary_bundle,
         },
     }
 
     LOGGER.info(
-        "Replay parse complete: durationSeconds=%s players=%s events=%s warnings=%s errors=%s totalMs=%s",
+        "Replay parse complete: durationSeconds=%s players=%s events=%s rawActions=%s warnings=%s errors=%s totalMs=%s",
         duration_seconds,
         len(participants),
         len(sorted_events),
+        len(raw_actions),
         len(warnings),
         len(parse_errors),
-        total_parse_ms,
+        round((perf_counter() - parse_started_at) * 1000, 2),
     )
 
     return report
@@ -1302,7 +2110,6 @@ def build_error_response(
 ) -> JsonDict:
     replay_path = getattr(args, "replay_path", None)
     debug = bool(getattr(args, "debug", False))
-
     response: JsonDict = {
         "ok": False,
         "error": "Replay parse failed.",
@@ -1314,10 +2121,8 @@ def build_error_response(
             "schemaVersion": UPLOAD_REPORT_SCHEMA_VERSION,
         },
     }
-
     if debug:
         response["details"]["traceback"] = traceback.format_exc()
-
     return response
 
 
@@ -1326,14 +2131,9 @@ def infer_filename_metadata(replay_path: Path) -> JsonDict:
     version_match = FILENAME_VERSION_RE.search(name)
     date_match = FILENAME_DATE_RE.search(name)
     played_at = None
-
     if date_match:
         groups = date_match.groupdict(default="00")
-        played_at = (
-            f"{groups['year']}-{groups['month']}-{groups['day']}T"
-            f"{groups['hour']}:{groups['minute']}:{groups['second']}"
-        )
-
+        played_at = f"{groups['year']}-{groups['month']}-{groups['day']}T{groups['hour']}:{groups['minute']}:{groups['second']}"
     return {
         "version": version_match.group("version") if version_match else None,
         "playedAt": played_at,
@@ -1344,10 +2144,36 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
     replay_path = Path(args.replay_path)
     file_size = replay_path.stat().st_size if replay_path.exists() else 0
     filename_metadata = infer_filename_metadata(replay_path)
-
     parser_message = str(error)
     replay_id = args.replay_id or replay_path.stem
     replay_version = filename_metadata.get("version") or "Unknown"
+
+    file_sha1 = None
+    file_preview = None
+    if replay_path.exists() and replay_path.is_file():
+        raw_bytes = replay_path.read_bytes()
+        file_sha1 = hashlib.sha1(raw_bytes).hexdigest()
+        file_preview = {
+            "length": len(raw_bytes),
+            "hexPreview": raw_bytes[:512].hex(),
+        }
+
+    fallback_warnings = [
+        {
+            "code": "partial_report",
+            "message": "The replay was saved, but structured parsing failed.",
+            "context": {"fallback": "filename_and_file_inspection"},
+        }
+    ]
+
+    # Even when the fast header parser fails, try the official summary/model paths.
+    # Summary may fall back to the full parser in official aoc-mgz installs.
+    model_bundle = try_build_model_bundle(
+        replay_path, not getattr(args, "no_model", False), fallback_warnings
+    )
+    summary_bundle = try_build_summary_bundle(
+        replay_path, not getattr(args, "no_summary", False), fallback_warnings
+    )
 
     return {
         "ok": True,
@@ -1365,6 +2191,9 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
             "schemaVersion": UPLOAD_REPORT_SCHEMA_VERSION,
             "winningTeam": None,
             "winningPlayerSlots": [],
+            "resultSource": "unknown",
+            "resultConfidence": None,
+            "resultExplanation": "The parser could not read enough replay data to infer a result.",
         },
         "players": [],
         "events": [
@@ -1373,10 +2202,7 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
                 "playerSlot": None,
                 "type": "parser_limit",
                 "label": "Replay uploaded, but this file format could not be fully parsed yet.",
-                "metadata": {
-                    "error": parser_message,
-                    "source": "parser_fallback",
-                },
+                "metadata": {"error": parser_message, "source": "parser_fallback"},
             }
         ],
         "insights": [
@@ -1384,7 +2210,7 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
                 "playerSlot": None,
                 "category": "parser",
                 "severity": "warning",
-                "text": "This replay was stored successfully, but the parser could not read its header. It may be from a newer AoE2: DE build or a replay type the MVP parser does not support yet.",
+                "text": "This replay was stored successfully, but the parser could not read its header. It may be from a newer AoE2: DE build or a replay type the parser does not support yet.",
             },
             {
                 "playerSlot": None,
@@ -1403,24 +2229,15 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
                 "stem": replay_path.stem,
                 "suffix": replay_path.suffix,
                 "sizeBytes": file_size,
+                "sha1": file_sha1,
             },
             "diagnostics": {
-                "warnings": [
-                    {
-                        "code": "partial_report",
-                        "message": "The replay was saved, but structured parsing failed.",
-                        "context": {
-                            "fallback": "filename_and_file_inspection",
-                        },
-                    }
-                ],
+                "warnings": fallback_warnings,
                 "parseErrors": [
                     {
                         "code": "header_parse_failed",
                         "message": parser_message,
-                        "context": {
-                            "type": type(error).__name__,
-                        },
+                        "context": {"type": type(error).__name__},
                     }
                 ],
                 "timingsMs": {
@@ -1437,16 +2254,23 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
                 "timelineEventsTotal": 1,
                 "timelineEventsCaptured": 1,
                 "timelineEventsTruncated": False,
+                "resultInference": {
+                    "source": "unknown",
+                    "confidence": None,
+                    "explanation": "The parser could not read enough replay data to infer a result.",
+                },
                 "gameDataCounts": {
                     "civilizations": 0,
                     "technologies": 0,
                     "buildings": 0,
                     "units": 0,
+                    "objects": 0,
                 },
             },
             "operationCounts": {},
             "actionCounts": {},
             "actionCountsByPlayer": {},
+            "playerCommandData": {},
             "chats": [],
             "headerSummary": {
                 "mapSeed": None,
@@ -1459,6 +2283,18 @@ def build_partial_report(error: BaseException, args: argparse.Namespace) -> Json
                 "modName": None,
                 "rmsMapId": None,
             },
+            "extracted": {
+                "filePreview": file_preview,
+                "rawActions": [],
+                "syncStats": [],
+                "playerTimeseries": {},
+                "viewlocks": [],
+                "postgame": [],
+            },
+            "headerStructure": {},
+            "header": None,
+            "model": model_bundle,
+            "summary": summary_bundle,
         },
     }
 
@@ -1467,32 +2303,69 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Parse an AoE2 replay into an MVP-friendly analytics report."
     )
-
     parser.add_argument("replay_path")
     parser.add_argument("--replay-id", default="")
     parser.add_argument("--aoe2-path", default=None)
     parser.add_argument(
         "--max-events",
         type=int,
-        default=0,
-        help="Maximum timeline events to include. Use 0 for every recovered event.",
+        default=-1,
+        help="Maximum timeline events in report.events. Use -1 for unlimited.",
     )
-    parser.add_argument("--max-chats", type=int, default=50)
+    parser.add_argument(
+        "--max-chats",
+        type=int,
+        default=-1,
+        help="Maximum raw chat messages to include. Use -1 for unlimited.",
+    )
+    parser.add_argument(
+        "--max-raw-actions",
+        type=int,
+        default=-1,
+        help="Maximum raw ACTION rows to include. Use -1 for unlimited.",
+    )
+    parser.add_argument(
+        "--max-viewlocks",
+        type=int,
+        default=2000,
+        help="Maximum VIEWLOCK rows to include. Use -1 for unlimited.",
+    )
+    parser.add_argument(
+        "--max-sync-stats",
+        type=int,
+        default=-1,
+        help="Maximum SYNC stat rows and per-player timeseries rows. Use -1 for unlimited.",
+    )
+    parser.add_argument("--max-operation-samples", type=int, default=20)
+    parser.add_argument("--max-positions-per-player", type=int, default=500)
+    parser.add_argument("--max-tributes-per-player", type=int, default=200)
+    parser.add_argument("--header-depth", type=int, default=25)
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="Do not include the JSON-safe raw header in rawInspection.header.",
+    )
+    parser.add_argument(
+        "--no-model",
+        action="store_true",
+        help="Do not attempt mgz.model.parse_match serialization.",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Do not attempt mgz.summary.Summary extraction.",
+    )
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("--debug", action="store_true")
-
     return parser.parse_args()
 
 
 def main() -> None:
     args: argparse.Namespace | None = None
-
     try:
         args = parse_args()
         configure_logging(args.debug)
-
         report = parse_replay(args)
-
         print(
             json.dumps(
                 report,
@@ -1504,15 +2377,12 @@ def main() -> None:
     except Exception as error:
         if args is None:
             configure_logging(debug=False)
-
         LOGGER.exception("Replay parse failed.")
-
         response = (
             build_partial_report(error, args)
             if args is not None
             else build_error_response(error, args)
         )
-
         print(
             json.dumps(
                 response,
@@ -1521,7 +2391,6 @@ def main() -> None:
                 default=str,
             )
         )
-
         raise SystemExit(0 if args is not None else 1)
 
 

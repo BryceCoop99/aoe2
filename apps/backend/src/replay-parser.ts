@@ -13,9 +13,9 @@ const defaultPythonBin =
 
 const pythonBin = process.env.REPLAY_PYTHON_BIN || defaultPythonBin;
 const parserScriptPath = path.join(appRoot, "scripts", "parse_replay.py");
-const maxTimelineEvents = parseNonNegativeInt(
+const maxTimelineEvents = parseInteger(
   process.env.REPLAY_MAX_TIMELINE_EVENTS,
-  0,
+  -1,
 ).toString();
 const parserStdoutBufferMb = parsePositiveInt(
   process.env.REPLAY_PARSER_STDOUT_BUFFER_MB,
@@ -60,11 +60,11 @@ function parsePositiveInt(value: string | undefined, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function parseNonNegativeInt(value: string | undefined, fallback: number) {
+function parseInteger(value: string | undefined, fallback: number) {
   if (!value) {
     return fallback;
   }
 
   const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
