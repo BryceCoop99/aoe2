@@ -6,7 +6,7 @@ This version intentionally extracts much more than the UI currently displays:
 - raw fast-operation action stream
 - all captured chat messages, unless limited by CLI flags
 - sync stat rows and per-player timeseries, when the rec contains them
-- viewlock samples
+- all decoded viewlock rows by default
 - postgame payloads, when available
 - raw JSON-safe header data
 - optional mgz.model serialized output
@@ -1061,6 +1061,102 @@ def record_named_timing(
         entry["firstPayload"] = to_jsonable(payload)
 
 
+def action_event_summary(
+    action_name: str,
+    action_data: JsonDict,
+    game_data: dict[str, Any],
+    player_name: str,
+) -> tuple[str, str, JsonDict]:
+    """Build a readable event row for every ACTION operation.
+
+    This is intentionally broad. The curated timeline still adds richer key
+    events such as `building`, `technology`, `unit`, and `resign`, but when
+    --event-detail=all is enabled this helper makes sure the report.events
+    array also has a row for every low-level action we can decode.
+    """
+    metadata: JsonDict = {
+        "source": "action",
+        "actionType": action_name,
+    }
+
+    for field in (
+        "command_id",
+        "order_id",
+        "resource_id",
+        "formation_id",
+        "stance_id",
+        "x",
+        "y",
+        "target_id",
+        "object_id",
+        "unit_id",
+        "building_id",
+        "technology_id",
+        "amount",
+    ):
+        if field in action_data:
+            metadata[field] = action_data.get(field)
+
+    if action_name == "RESEARCH":
+        technology_id = action_data.get("technology_id")
+        technology_name = id_name(game_data, "technology", technology_id, "Tech")
+        metadata["technologyId"] = technology_id
+        metadata["technologyName"] = technology_name
+        return (
+            "action_research",
+            f"{player_name} started research: {technology_name}.",
+            metadata,
+        )
+
+    if action_name == "BUILD":
+        building_id = action_data.get("building_id")
+        building_name = id_name(game_data, "building", building_id, "Building")
+        metadata["buildingId"] = building_id
+        metadata["buildingName"] = building_name
+        return (
+            "action_build",
+            f"{player_name} issued build command: {building_name}.",
+            metadata,
+        )
+
+    if action_name == "MAKE":
+        unit_id = action_data.get("unit_id")
+        unit_name = id_name(game_data, "unit", unit_id, "Unit")
+        metadata["unitId"] = unit_id
+        metadata["unitName"] = unit_name
+        return (
+            "action_make",
+            f"{player_name} queued/made unit: {unit_name}.",
+            metadata,
+        )
+
+    if action_name == "RESIGN":
+        return ("action_resign", f"{player_name} resigned.", metadata)
+
+    if action_name == "TRIBUTE":
+        return ("action_tribute", f"{player_name} sent tribute.", metadata)
+
+    if action_name in {
+        "MOVE",
+        "ORDER",
+        "WAYPOINT",
+        "MULTI_GATHERPOINT",
+        "GATHER_POINT",
+        "PATROL",
+    }:
+        return (
+            f"action_{action_name.lower()}",
+            f"{player_name} issued {action_name.replace('_', ' ').lower()} command.",
+            metadata,
+        )
+
+    return (
+        f"action_{action_name.lower()}",
+        f"{player_name} issued {action_name.replace('_', ' ').lower()} action.",
+        metadata,
+    )
+
+
 def finalize_player_timings(
     participants: list[JsonDict],
     age_ups: dict[int, dict[str, int]],
@@ -1579,7 +1675,8 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
             operation_name = safe_enum_name(op_type)
             operation_counts[operation_name] += 1
             if (
-                len(operation_samples_by_type[operation_name])
+                args.max_operation_samples < 0
+                or len(operation_samples_by_type[operation_name])
                 < args.max_operation_samples
             ):
                 operation_samples_by_type[operation_name].append(
@@ -1662,6 +1759,21 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 if not append_limited(chats, chat_item, args.max_chats):
                     truncation["chats"] = truncation.get("chats", 0) + 1
 
+                if args.event_detail == "all":
+                    add_timeline_event(
+                        events,
+                        current_second,
+                        chat_player if isinstance(chat_player, int) else None,
+                        "chat",
+                        chat_message or decode_text(payload),
+                        {
+                            "source": "chat",
+                            "operationIndex": operation_index,
+                            "offset": current_offset,
+                            "raw": to_jsonable(parsed_chat, max_depth=10),
+                        },
+                    )
+
                 age_match = SYSTEM_AGE_UP_RE.search(chat_message)
                 if age_match:
                     player_slot = int(age_match.group(1))
@@ -1731,6 +1843,33 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
             }
             if not append_limited(raw_actions, raw_action, args.max_raw_actions):
                 truncation["rawActions"] = truncation.get("rawActions", 0) + 1
+
+            if args.event_detail == "all":
+                event_player_name = (
+                    player["name"]
+                    if player is not None
+                    else (
+                        f"Player {player_slot}"
+                        if isinstance(player_slot, int)
+                        else "Unknown player"
+                    )
+                )
+                event_type, event_label, event_metadata = action_event_summary(
+                    action_name,
+                    action_data,
+                    game_data,
+                    event_player_name,
+                )
+                event_metadata["operationIndex"] = operation_index
+                event_metadata["offset"] = current_offset
+                add_timeline_event(
+                    events,
+                    current_second,
+                    player_slot if isinstance(player_slot, int) else None,
+                    event_type,
+                    event_label,
+                    event_metadata,
+                )
 
             if player is not None:
                 action_counts_by_player[player_slot][action_name] += 1
@@ -2042,6 +2181,7 @@ def parse_replay(args: argparse.Namespace) -> JsonDict:
                 "timelineEventsTotal": len(sorted_events),
                 "timelineEventsCaptured": len(visible_events),
                 "timelineEventsTruncated": len(visible_events) < len(sorted_events),
+                "eventDetail": args.event_detail,
                 "resultInference": result_inference,
                 "gameDataCounts": {
                     "civilizations": len(game_data["civilizations"]),
@@ -2327,7 +2467,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-viewlocks",
         type=int,
-        default=2000,
+        default=-1,
         help="Maximum VIEWLOCK rows to include. Use -1 for unlimited.",
     )
     parser.add_argument(
@@ -2336,9 +2476,18 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Maximum SYNC stat rows and per-player timeseries rows. Use -1 for unlimited.",
     )
-    parser.add_argument("--max-operation-samples", type=int, default=20)
-    parser.add_argument("--max-positions-per-player", type=int, default=500)
-    parser.add_argument("--max-tributes-per-player", type=int, default=200)
+    parser.add_argument(
+        "--event-detail",
+        choices=("key", "all"),
+        default="all",
+        help=(
+            "Use 'key' for a curated report.events timeline, or 'all' to add "
+            "a report.events row for every decoded ACTION plus every CHAT."
+        ),
+    )
+    parser.add_argument("--max-operation-samples", type=int, default=-1)
+    parser.add_argument("--max-positions-per-player", type=int, default=-1)
+    parser.add_argument("--max-tributes-per-player", type=int, default=-1)
     parser.add_argument("--header-depth", type=int, default=25)
     parser.add_argument(
         "--no-header",

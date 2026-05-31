@@ -6,6 +6,7 @@ import { ReplayReport } from "./report-types.js";
 const execFileAsync = promisify(execFile);
 
 const appRoot = process.cwd();
+
 const defaultPythonBin =
   process.platform === "win32"
     ? path.join(appRoot, ".venv", "Scripts", "python.exe")
@@ -13,58 +14,94 @@ const defaultPythonBin =
 
 const pythonBin = process.env.REPLAY_PYTHON_BIN || defaultPythonBin;
 const parserScriptPath = path.join(appRoot, "scripts", "parse_replay.py");
-const maxTimelineEvents = parseInteger(
-  process.env.REPLAY_MAX_TIMELINE_EVENTS,
-  -1,
-).toString();
-const parserStdoutBufferMb = parsePositiveInt(
-  process.env.REPLAY_PARSER_STDOUT_BUFFER_MB,
-  100,
-);
+
+const PARSER_STDOUT_MAX_BUFFER = 256 * 1024 * 1024;
 
 export async function parseReplayFile(filePath: string, replayId: string) {
-  const { stdout, stderr } = await execFileAsync(
+  const args = [
+    parserScriptPath,
+    "--replay-id",
+    replayId,
+
+    // Keep the curated timeline unlimited.
+    "--max-events",
+    "-1",
+
+    // Keep all useful chat and action rows.
+    "--max-chats",
+    "-1",
+    "--max-raw-actions",
+    "-1",
+    "--max-sync-stats",
+    "-1",
+
+    // Viewlocks can be extremely noisy, but you asked for as much as possible.
+    "--max-viewlocks",
+    "-1",
+
+    // These can also get large.
+    "--max-operation-samples",
+    "-1",
+    "--max-positions-per-player",
+    "-1",
+    "--max-tributes-per-player",
+    "-1",
+
+    filePath,
+  ];
+
+  console.log("[parseReplayFile] starting parser", {
+    replayId,
+    filePath,
     pythonBin,
-    [
-      parserScriptPath,
-      "--replay-id",
-      replayId,
-      "--max-events",
-      maxTimelineEvents,
-      filePath,
-    ],
-    {
-      cwd: appRoot,
-      env: {
-        ...process.env,
-        PYTHONIOENCODING: "utf-8",
-      },
-      maxBuffer: parserStdoutBufferMb * 1024 * 1024,
-      windowsHide: true,
+    parserScriptPath,
+    maxBufferMb: PARSER_STDOUT_MAX_BUFFER / 1024 / 1024,
+  });
+
+  const { stdout, stderr } = await execFileAsync(pythonBin, args, {
+    cwd: appRoot,
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: "utf-8",
     },
-  );
+    maxBuffer: PARSER_STDOUT_MAX_BUFFER,
+    windowsHide: true,
+  });
+
+  if (stderr.trim()) {
+    console.warn("[parseReplayFile] parser stderr", {
+      replayId,
+      stderr,
+    });
+  }
 
   if (!stdout.trim()) {
     throw new Error(stderr.trim() || "The replay parser returned no output.");
   }
 
-  return JSON.parse(stdout) as ReplayReport;
-}
+  const report = JSON.parse(stdout) as ReplayReport;
 
-function parsePositiveInt(value: string | undefined, fallback: number) {
-  if (!value) {
-    return fallback;
-  }
+  console.log("[parseReplayFile] parser completed", {
+    replayId,
+    partial: Boolean(report.partial),
+    map: report.match?.map,
+    durationSeconds: report.match?.durationSeconds,
+    players: report.players?.length ?? 0,
+    events: report.events?.length ?? 0,
+    rawActions:
+      report.rawInspection.extracted?.rawActionsCountReturned ??
+      report.rawInspection.extracted?.rawActions?.length ??
+      0,
+    chats: report.rawInspection.chats?.length ?? 0,
+    syncStats:
+      report.rawInspection.extracted?.syncStatsCountReturned ??
+      report.rawInspection.extracted?.syncStats?.length ??
+      0,
+    viewlocks:
+      report.rawInspection.extracted?.viewlocksCountReturned ??
+      report.rawInspection.extracted?.viewlocks?.length ??
+      0,
+  });
 
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function parseInteger(value: string | undefined, fallback: number) {
-  if (!value) {
-    return fallback;
-  }
-
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  return report;
 }
